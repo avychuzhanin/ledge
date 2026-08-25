@@ -1,0 +1,13 @@
+# Сборочный мусор: пересоздаётся из исходников, в истории не нужен
+.build/
+DerivedData/
+*.app/
+.last-build-hash
+.testfiles/
+*.iconset
+
+# Свалка удалённого — история и есть git
+~archive/
+
+.DS_Store
+*.xcuserstate
