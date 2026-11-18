@@ -36,9 +36,25 @@ enum Paster {
         var writers: [NSPasteboardWriting] = []
         for item in items {
             if let t = item.text { writers.append(t as NSString) }
-            else if let u = item.url { writers.append(u as NSURL) }
+            else if let u = item.url { writers.append(item.isImage ? picture(u) : u as NSURL) }
         }
         pb.writeObjects(writers)
+    }
+
+    /// Картинку кладём и пикселями, и файлом. Одна ссылка на файл годится
+    /// только Finder'у — Figma, браузер, мессенджеры ждут саму картинку,
+    /// и вставка у них выходила пустой.
+    private static func picture(_ url: URL) -> NSPasteboardWriting {
+        let out = NSPasteboardItem()
+        if let data = try? Data(contentsOf: url),
+           let rep = NSBitmapImageRep(data: data) {
+            let png = url.pathExtension.lowercased() == "png"
+                ? data : rep.representation(using: .png, properties: [:])
+            if let png { out.setData(png, forType: .png) }
+            if let tiff = rep.tiffRepresentation { out.setData(tiff, forType: .tiff) }
+        }
+        out.setString(url.absoluteString, forType: .fileURL)
+        return out
     }
 
     /// Скопировать и вставить туда, откуда пришли.

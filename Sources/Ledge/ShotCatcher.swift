@@ -39,6 +39,21 @@ final class ShotCatcher {
 
     // MARK: системная настройка
 
+    /// Настройки читаем и пишем напрямую через CFPreferences, а не через
+    /// `defaults`: у приложения нет локали, и `defaults read` печатал
+    /// «Снимки» как `\u0421\u043d…`. Сторож считал настройку сбитой,
+    /// чинил её каждые 20 секунд и вместе с этим ронял очередь снимков.
+    private static let domain = "com.apple.screencapture" as CFString
+
+    private func pref(_ key: String) -> Any? {
+        CFPreferencesCopyAppValue(key as CFString, Self.domain)
+    }
+
+    private func setPref(_ key: String, _ value: CFPropertyList?) {
+        CFPreferencesSetAppValue(key as CFString, value, Self.domain)
+        CFPreferencesAppSynchronize(Self.domain)
+    }
+
     private func enable() {
         try? FileManager.default.createDirectory(at: Self.folder,
                                                  withIntermediateDirectories: true)
@@ -46,7 +61,7 @@ final class ShotCatcher {
         if d.string(forKey: Self.savedKey) == nil {
             d.set(currentLocation() ?? "", forKey: Self.savedKey)
         }
-        setLocation(Self.folder.path)
+        if !locationIsOurs { setLocation(Self.folder.path) }
         hideThumbnail()
         known = Set(listing())
         watch()
@@ -66,40 +81,52 @@ final class ShotCatcher {
     /// из-за неё снимок попадал на полку с задержкой. Выключаем.
     private func hideThumbnail() {
         let d = UserDefaults.standard
+        let shown = thumbnailShown
         if d.string(forKey: Self.savedThumbKey) == nil {
-            let was = run("/usr/bin/defaults",
-                          ["read", "com.apple.screencapture", "show-thumbnail"])
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            d.set(was.isEmpty ? "1" : was, forKey: Self.savedThumbKey)
+            d.set(shown ? "1" : "0", forKey: Self.savedThumbKey)
         }
-        _ = run("/usr/bin/defaults",
-                ["write", "com.apple.screencapture", "show-thumbnail", "-bool", "false"])
-        _ = run("/usr/bin/killall", ["SystemUIServer"])
+        guard shown else { return }
+        setPref("show-thumbnail", kCFBooleanFalse)
+        restartMenuBar()
     }
 
     private func restoreThumbnail() {
         let was = UserDefaults.standard.string(forKey: Self.savedThumbKey) ?? "1"
-        _ = run("/usr/bin/defaults",
-                ["write", "com.apple.screencapture", "show-thumbnail", "-bool",
-                 was == "0" ? "false" : "true"])
-        _ = run("/usr/bin/killall", ["SystemUIServer"])
+        setPref("show-thumbnail", was == "0" ? kCFBooleanFalse : kCFBooleanTrue)
+        restartMenuBar()
         UserDefaults.standard.removeObject(forKey: Self.savedThumbKey)
     }
 
+    /// Нет настройки — превьюшка включена, так у macOS по умолчанию.
+    private var thumbnailShown: Bool {
+        guard let v = pref("show-thumbnail") else { return true }
+        if let b = v as? Bool { return b }
+        if let n = v as? NSNumber { return n.boolValue }
+        return true
+    }
+
     private func currentLocation() -> String? {
-        let out = run("/usr/bin/defaults", ["read", "com.apple.screencapture", "location"])
-        let s = out.trimmingCharacters(in: .whitespacesAndNewlines)
-        return s.isEmpty ? nil : s
+        guard let s = pref("location") as? String, !s.isEmpty else { return nil }
+        return s
+    }
+
+    /// Сравниваем пути как пути: тильда, хвостовой слеш и форма юникода
+    /// не должны считаться «другой папкой».
+    private var locationIsOurs: Bool {
+        guard let s = currentLocation() else { return false }
+        let path = (s as NSString).expandingTildeInPath
+        return URL(fileURLWithPath: path).standardizedFileURL.path
+            == Self.folder.standardizedFileURL.path
     }
 
     private func setLocation(_ path: String?) {
-        if let path {
-            _ = run("/usr/bin/defaults",
-                    ["write", "com.apple.screencapture", "location", "-string", path])
-        } else {
-            _ = run("/usr/bin/defaults", ["delete", "com.apple.screencapture", "location"])
-        }
-        _ = run("/usr/bin/killall", ["SystemUIServer"])
+        setPref("location", path.map { $0 as CFString })
+        restartMenuBar()
+    }
+
+    /// Старый снимочный конвейер перечитывал настройку только после перезапуска.
+    private func restartMenuBar() {
+        run("/usr/bin/killall", ["SystemUIServer"])
     }
 
     @discardableResult
@@ -131,11 +158,16 @@ final class ShotCatcher {
         guard fd >= 0 else { return }
         let src = DispatchSource.makeFileSystemObjectSource(
             fileDescriptor: fd, eventMask: [.write, .extend, .rename, .delete], queue: .main)
-        src.setEventHandler { [weak self] in
+        src.setEventHandler { [weak self, weak src] in
             guard let self else { return }
             // Папку могли снести — тогда снимки перестают сохраняться вообще,
             // потому что система пишет их по несуществующему пути.
             guard self.folderAlive() else { return self.repair() }
+            // Папку снесли и тут же создали заново: путь жив, а дескриптор
+            // смотрит в старую, мёртвую папку. Переподключаемся.
+            if let flags = src?.data, !flags.intersection([.delete, .rename]).isEmpty {
+                return self.rewatch()
+            }
             self.scan()
         }
         let handle = fd
@@ -151,11 +183,20 @@ final class ShotCatcher {
     }
 
     /// Возвращаем папку и системную настройку на место.
+    /// Слежку перезапускаем только если папка пропадала: иначе сбросим
+    /// очередь снимков, которые ещё не успели осесть, и они пропадут с полки.
     private func repair() {
-        try? FileManager.default.createDirectory(at: Self.folder,
-                                                 withIntermediateDirectories: true)
-        guard folderAlive() else { return }
-        if currentLocation() != Self.folder.path { setLocation(Self.folder.path) }
+        let wasAlive = folderAlive()
+        if !wasAlive {
+            try? FileManager.default.createDirectory(at: Self.folder,
+                                                     withIntermediateDirectories: true)
+            guard folderAlive() else { return }
+        }
+        if !locationIsOurs { setLocation(Self.folder.path) }
+        if !wasAlive || source == nil { rewatch() }
+    }
+
+    private func rewatch() {
         known = Set(listing())
         watch()
     }
@@ -166,9 +207,7 @@ final class ShotCatcher {
         guardTimer?.invalidate()
         guardTimer = Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { [weak self] _ in
             guard let self, self.isOn else { return }
-            if !self.folderAlive() || self.currentLocation() != Self.folder.path {
-                self.repair()
-            }
+            if !self.folderAlive() || !self.locationIsOurs { self.repair() }
         }
     }
 

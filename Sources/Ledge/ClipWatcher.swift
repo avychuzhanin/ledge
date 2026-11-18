@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 
 /// Всё скопированное — текст, картинки, SVG, файлы, ссылки — кладём на полку.
 /// Содержимое, помеченное менеджерами паролей, пропускаем.
@@ -12,6 +13,13 @@ final class ClipWatcher {
     private var timer: Timer?
     private var lastChange = 0
     private var lastPrint: Int?
+    /// Что легло на полку от последнего копирования. Убрали его с полки —
+    /// то же самое, скопированное заново, снова должно туда попасть.
+    private var lastItem: UUID?
+    private var watch: AnyCancellable?
+    /// Сколько раз уже заглядывали в одно и то же копирование.
+    private var tries = 0
+    private static let maxTries = 8   // ≈ 3,5 секунды
 
     var isOn: Bool { UserDefaults.standard.bool(forKey: Self.key) }
 
@@ -19,6 +27,11 @@ final class ClipWatcher {
         self.store = store
         UserDefaults.standard.register(defaults: [Self.key: true])
         lastChange = NSPasteboard.general.changeCount
+        watch = store.$items.sink { [weak self] items in
+            guard let self, self.lastPrint != nil else { return }
+            let gone = self.lastItem.map { id in !items.contains { $0.id == id } } ?? false
+            if items.isEmpty || gone { self.lastPrint = nil; self.lastItem = nil }
+        }
     }
 
     func apply() { isOn ? start() : stop() }
@@ -43,19 +56,32 @@ final class ClipWatcher {
 
     private func check() {
         let pb = NSPasteboard.general
-        guard pb.changeCount != lastChange else { return }
-        lastChange = pb.changeCount
-        if Self.skipNext { Self.skipNext = false; lastPrint = fingerprint(pb); return }
-        guard !Ingest.isSecret(pb), Ingest.canAccept(pb) else { return }
+        let count = pb.changeCount
+        guard count != lastChange else { return }
+        if Self.skipNext {
+            Self.skipNext = false
+            lastChange = count; tries = 0
+            lastPrint = fingerprint(pb); lastItem = nil
+            return
+        }
+        guard !Ingest.isSecret(pb) else { lastChange = count; tries = 0; return }
 
+        // Chrome сперва очищает буфер, а картинку дописывает чуть позже —
+        // номер копирования при этом не меняется. Заглянули слишком рано и
+        // ничего не нашли — не закрываем копирование, смотрим ещё раз.
+        var items: [ShelfItem] = []
         let print = fingerprint(pb)
-        guard print != lastPrint else { return }
-
-        var items = Ingest.items(from: pb, store: store, source: .clip)
+        if Ingest.canAccept(pb) {
+            guard print != lastPrint else { lastChange = count; tries = 0; return }
+            items = Ingest.items(from: pb, store: store, source: .clip)
+        }
+        if items.isEmpty, tries < Self.maxTries { tries += 1; return }
+        lastChange = count; tries = 0
         guard !items.isEmpty else { return }
         let from = Apps.frontmostID
         for i in items.indices { items[i].appID = from }
         lastPrint = print
+        lastItem = items.first?.id
         store.add(items)
     }
 
@@ -64,7 +90,12 @@ final class ClipWatcher {
         var h = Hasher()
         if let s = pb.string(forType: .fileURL) { h.combine(s) }
         if let s = pb.string(forType: .string) { h.combine(s) }
-        if let d = pb.data(forType: .tiff) { h.combine(d.count); h.combine(d.prefix(1024)) }
+        // Картинку сверяем целиком: по размеру и началу файла две разные
+        // картинки одного размера с одинаковым краем выглядели как одна,
+        // и вторую полка молча пропускала.
+        if let d = pb.data(forType: .png) ?? pb.data(forType: .tiff) {
+            d.withUnsafeBytes { h.combine(bytes: $0) }
+        }
         if let d = pb.data(forType: Ingest.svgType) { h.combine(d.count) }
         return h.finalize()
     }
